@@ -40,3 +40,5 @@ client = PushClient(access_token=groupme_access_token, on_message=on_message)
 
 client.start()
 ```
+## Issues
+If you encounter any bugs or have feature requests, [please open an issue on GitHub](https://github.com/cuuush/groupme-push/issues)

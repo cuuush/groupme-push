@@ -1,0 +1,3 @@
+dist/*
+groupme_push.egg-info/*
+*.pyc

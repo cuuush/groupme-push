@@ -11,9 +11,9 @@ readme = "README.md"
 authors = [{ name = "Chris Cush", email = "chris@cuuush.com" }]
 keywords = ["groupme", "push", "websocket"]
 dependencies = [
-    "base36 >= 0.1.1",
-    "requests >= 2.28.1",
-    "websocket-client >=1.4.0"
+    "base36>=0.1.1",
+    "requests>=2.28.1",
+    "websocket-client>=1.4.0"
 ]
 requires-python = ">=3.9"
 
