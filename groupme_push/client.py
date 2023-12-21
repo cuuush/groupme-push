@@ -155,7 +155,7 @@ class PushClient:
                 if (
                     self.disregard_self
                     and data["sender_id"] != "system"
-                    and int(data["sender_id"]) == self.user_id
+                    and int(data["sender_id"]) == int(self.user_id)
                 ):
                     logger.debug("Groupme discarding self message")
                     return
