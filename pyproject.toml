@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "groupme-push"
-version = "0.0.2"
+version = "0.0.3"
 description = "GroupMe push service wrapper"
 license = {text = "GPL-3.0-or-later"}
 readme = "README.md"
@@ -12,8 +12,8 @@ authors = [{ name = "Chris Cush", email = "chris@cuuush.com" }]
 keywords = ["groupme", "push", "websocket"]
 dependencies = [
     "base36>=0.1.1",
-    "requests~=2.20.0",
-    "websocket-client>=1.4.0"
+    "requests~=2.31.0",
+    "websocket-client>=1.7.0"
 ]
 requires-python = ">=3.9"
 
