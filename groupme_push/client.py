@@ -40,7 +40,7 @@ class PushClient:
                 timeout=5,
             )
             user = json.loads(resp.text)
-            self.user_id = user["response"]["user_id"]
+            self.user_id = int(user["response"]["user_id"])
 
             handshake = {
                 "channel": "/meta/handshake",
