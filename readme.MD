@@ -12,11 +12,12 @@ import `from  groupme_push.client  import  PushClient`
 PushClient has a couple of paramaters:
 - **access_token** - GroupMe access token for the user that you want to listen for
 - **on_message** -  a function to call whenver there is a new message in any group the user is in
-- **on_dm** - callback for DMs 
+- **on_dm** - callback for DMs
 - **on_like** - callback for when another user likes a message
 - **on_favorite** - callback for when your user likes a message
 - **on_other** - for any other type of message, such as poll results
 - **disregard_self** - if the listener should disregard messages originating from the user
+- **reconnect** - delay in seconds before reconnecting after connection loss (default: None, no reconnection)
 
 create a PushClient object with 
 `client = PushClient(access_token=groupme_access_token)`
