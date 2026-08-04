@@ -72,6 +72,16 @@ class PushClient:
             order at the cost of blocking the socket while they run.
         request_timeout: timeout in seconds for the HTTP calls made by
             :meth:`start`.
+        ping_interval: seconds between websocket pings, and ``ping_timeout``
+            seconds to wait for the pong. Without these a connection that dies
+            without closing cleanly, which is what a sleeping laptop or a NAT
+            timeout looks like, never raises and the client waits forever.
+            ``None`` disables them.
+        stall_timeout: seconds of silence after which the client checks whether
+            the stream is still alive, and rebuilds it if not. GroupMe sends
+            nothing down an idle connection, so this costs one small frame per
+            quiet interval rather than a reconnect. ``None`` disables the check.
+        probe_timeout: how long that check waits for an answer.
     """
 
     def __init__(
@@ -83,13 +93,17 @@ class PushClient:
         on_favorite=None,
         on_other=None,
         disregard_self=False,
-        reconnect=None,
+        reconnect=5,
         group_ids=None,
         subscribe_to_user_channel=True,
         threaded_callbacks=True,
         on_connect=None,
         on_error=None,
         request_timeout=5,
+        ping_interval=30,
+        ping_timeout=10,
+        stall_timeout=180,
+        probe_timeout=10,
     ):
         self.id = 1
         self.access_token = access_token
@@ -105,6 +119,17 @@ class PushClient:
         self.subscribe_to_user_channel = subscribe_to_user_channel
         self.threaded_callbacks = threaded_callbacks
         self.request_timeout = request_timeout
+        self.ping_interval = ping_interval
+        self.ping_timeout = ping_timeout
+        self.stall_timeout = stall_timeout
+        self.stall_check_interval = (
+            max(5.0, stall_timeout / 4.0) if stall_timeout else None
+        )
+        self.probe_timeout = probe_timeout
+
+        # Minimum gap between re-handshakes, so a server that keeps rejecting
+        # us cannot turn into a handshake loop.
+        self.rehandshake_interval = 30
 
         self.group_ids = {str(group_id) for group_id in group_ids or ()}
 
@@ -116,6 +141,10 @@ class PushClient:
         self.thread = None
         self.user_id = None
         self.client_id = None
+
+        self._last_frame_at = 0.0
+        self._last_rehandshake_at = 0.0
+        self._watchdog_thread = None
 
         # Groups we want, versus groups already subscribed on this connection.
         # The second set is what stops a group being subscribed twice when a
@@ -192,10 +221,17 @@ class PushClient:
         self.user_id = self._fetch_user_id()
         self.client_id = self._handshake()
 
+        self._last_frame_at = time.time()
         self.thread = threading.Thread(
             target=self.run_forever, name="groupme-push", daemon=False
         )
         self.thread.start()
+
+        if self.stall_timeout:
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog, name="groupme-push-watchdog", daemon=True
+            )
+            self._watchdog_thread.start()
 
         if wait and not self.wait_until_connected(timeout=timeout):
             self.stop()
@@ -248,10 +284,108 @@ class PushClient:
             on_close=self.on_close,
         )
 
+        kwargs = {}
         if self.reconnect is not None:
-            self.ws.run_forever(reconnect=self.reconnect)
+            kwargs["reconnect"] = self.reconnect
+        if self.ping_interval:
+            # Without this the reader blocks on a dead socket forever: a
+            # connection dropped by a NAT or a sleeping laptop never raises,
+            # so the client sits there "connected" and silent.
+            kwargs["ping_interval"] = self.ping_interval
+            kwargs["ping_timeout"] = self.ping_timeout
+
+        self.ws.run_forever(**kwargs)
+
+    def _watchdog(self):
+        """Notice when the stream has gone dead and rebuild it.
+
+        This is the failure that shows up as "it ran fine all day and then just
+        stopped receiving": the socket is open, the client says it is
+        connected, and nothing is ever delivered again. A dropped connection
+        that never raised, or a Faye session reaped server side, both look
+        exactly like a quiet day from in here.
+
+        GroupMe sends nothing at all down an idle connection, so silence on its
+        own proves nothing. When it has been quiet for too long we ask a
+        question instead of guessing: a /meta/subscribe is the one request
+        GroupMe always answers. An answer means the stream is fine, an error
+        means our session died, and no answer at all means the socket is gone.
+        """
+        while True:
+            if self._stopped.wait(self.stall_check_interval or 5.0):
+                return
+            if not self.stall_timeout or not self._connected.is_set():
+                continue
+            if time.time() - self._last_frame_at < self.stall_timeout:
+                continue
+
+            asked_at = time.time()
+            if not self._probe():
+                continue
+            if self._heard_from_server_since(asked_at):
+                logger.debug("Liveness probe answered, connection is healthy")
+                continue
+
+            logger.warning(
+                "No answer to liveness probe after {}s, forcing a reconnect".format(
+                    self.probe_timeout
+                )
+            )
+            self._last_frame_at = time.time()
+            self._force_reconnect()
+
+    def _probe(self):
+        """Re-subscribe to a channel we already hold, to see if anyone is home.
+
+        Faye subscriptions are a set, so re-subscribing is idempotent and does
+        not duplicate delivery. Returns False if there is nothing to probe with.
+        """
+        if self.subscribe_to_user_channel and self.user_id is not None:
+            channel = "/user/{}".format(self.user_id)
+        elif self._active_groups:
+            channel = "/group/{}".format(sorted(self._active_groups)[0])
         else:
-            self.ws.run_forever()
+            logger.debug("Nothing subscribed, skipping liveness probe")
+            return False
+
+        logger.debug("Connection quiet, probing with a subscribe to {}".format(channel))
+        try:
+            self.subscribe(self.ws, channel)
+        except Exception as error:
+            logger.warning("Liveness probe could not be sent: {}".format(error))
+            self._force_reconnect()
+            return False
+        return True
+
+    def _heard_from_server_since(self, timestamp):
+        deadline = time.time() + self.probe_timeout
+        while time.time() < deadline:
+            if self._last_frame_at > timestamp:
+                return True
+            if self._stopped.wait(0.1):
+                return True
+        return self._last_frame_at > timestamp
+
+    def _force_reconnect(self):
+        """Drop the underlying socket so run_forever reconnects.
+
+        Deliberately not ws.close(): that tells WebSocketApp we meant to stop,
+        and it will not reconnect afterwards.
+        """
+        if self.reconnect is None:
+            logger.error(
+                "Connection looks dead but reconnect is disabled; "
+                "pass reconnect=<seconds> to recover automatically"
+            )
+            return
+        self._connected.clear()
+        socket = getattr(self.ws, "sock", None)
+        if socket is None:
+            return
+        try:
+            socket.close()
+        except Exception as error:  # pragma: no cover - defensive
+            logger.debug("Error dropping socket: {}".format(error))
 
     # -- http helpers ------------------------------------------------------
 
@@ -464,6 +598,7 @@ class PushClient:
             self._dispatch(self.error_callback, (error,))
 
     def on_message(self, ws, message):
+        self._last_frame_at = time.time()
         try:
             messages = json.loads(message)
         except ValueError:
@@ -501,11 +636,19 @@ class PushClient:
                     "Subscription success to {}".format(envelope.get("subscription"))
                 )
             else:
+                error = str(envelope.get("error", ""))
                 logger.error(
                     "Subscription to {} failed: {}".format(
-                        envelope.get("subscription"), envelope.get("error")
+                        envelope.get("subscription"), error
                     )
                 )
+                # While a session is healthy GroupMe never answers
+                # /meta/connect, so the connect loop cannot be relied on to
+                # notice trouble. A rejected subscribe is the signal that
+                # reliably arrives. Ignoring it leaves a socket that is open,
+                # "connected" and permanently silent.
+                if error.startswith(_INVALID_CLIENT_ID):
+                    self._rehandshake(ws)
             return
 
         if channel == "/meta/unsubscribe":
@@ -561,21 +704,36 @@ class PushClient:
             return
 
         if error.startswith(_INVALID_CLIENT_ID) or advice.get("reconnect") == "handshake":
-            # Our session was reaped; get a fresh client id and re-subscribe
-            # rather than sitting on a socket that will never deliver again.
-            logger.info("Faye client id expired, re-handshaking")
-            try:
-                self.client_id = self._handshake()
-            except GroupMePushError as handshake_error:
-                logger.error("Re-handshake failed: {}".format(handshake_error))
-                return
-            self.on_open(ws)
+            self._rehandshake(ws)
             return
 
         # Unknown failure: back off a little and retry rather than dropping
         # out of the polling loop, which would silently stop delivery.
         if not self._stopped.wait(timeout=self.retry_backoff):
             self.send_connect(ws)
+
+    def _rehandshake(self, ws):
+        """Get a fresh Faye client id and re-subscribe everything.
+
+        Our session was reaped, so the socket is open but will never deliver
+        again. Rate limited, because a server that keeps rejecting us should
+        not turn into a handshake loop.
+        """
+        since_last = time.time() - self._last_rehandshake_at
+        if since_last < self.rehandshake_interval:
+            logger.debug(
+                "Skipping re-handshake, last one was {:.0f}s ago".format(since_last)
+            )
+            return
+        self._last_rehandshake_at = time.time()
+
+        logger.info("Faye client id expired, re-handshaking")
+        try:
+            self.client_id = self._handshake()
+        except GroupMePushError as handshake_error:
+            logger.error("Re-handshake failed: {}".format(handshake_error))
+            return
+        self.on_open(ws)
 
     # -- dispatch ----------------------------------------------------------
 
