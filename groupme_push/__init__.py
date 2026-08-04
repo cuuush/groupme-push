@@ -8,7 +8,7 @@ from groupme_push.exceptions import (
     HandshakeError,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.0.4"
 
 __all__ = [
     "PushClient",
