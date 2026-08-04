@@ -60,6 +60,7 @@ for group_id, name in PushClient(access_token="useraccesstoken").list_groups():
 | `ping_interval` / `ping_timeout` | Websocket keepalive. Defaults `30` / `10`. See below. |
 | `stall_timeout` | Seconds of silence after which the client checks that the stream is still alive. Default `180`. `None` disables the check. |
 | `probe_timeout` | How long that check waits for an answer. Default `10`. |
+| `subscribe_timeout` | Seconds to wait for a connection's subscriptions to be accepted before rebuilding the session. Default `15`. `None` disables the check. |
 | `group_ids` | Only dispatch events from these groups. Default: no filtering. |
 | `subscribe_to_user_channel` | Subscribe to `/user/<id>` on connect. This is where GroupMe delivers messages, so leave it on unless you know otherwise. Default `True`. |
 | `threaded_callbacks` | Run each callback in its own thread. Set `False` to run them inline, which keeps events in order but blocks the socket while they run. Default `True`. |
@@ -73,9 +74,11 @@ The client handles this out of the box:
 
 - **Websocket pings** (`ping_interval`) keep the connection warm and, more importantly, make a dead connection *raise* instead of hanging. Without them the reader blocks on a socket that will never produce another byte, which is what a sleeping laptop or a NAT timeout leaves behind.
 - **Automatic reconnection** is on by default (`reconnect=5`). Subscriptions are replayed on the new connection.
-- **A liveness check** (`stall_timeout`). GroupMe sends nothing at all down an idle connection, so silence proves nothing on its own. After a quiet stretch the client asks a question instead of guessing: it re-subscribes to a channel it already holds, which is the one request GroupMe reliably answers. An answer means the stream is fine, an error means the session was reaped and it re-handshakes, and no answer at all means the socket is gone and it reconnects.
+- **A liveness check** (`stall_timeout`). GroupMe sends nothing at all down an idle connection, so silence proves nothing on its own. After a quiet stretch the client asks a question instead of guessing: it re-subscribes to a channel it already holds, which is the one request GroupMe reliably answers. An answer means the stream is fine, an error means the session was reaped and it rebuilds, and no answer at all means the socket is gone and it reconnects.
+- **A subscription check** (`subscribe_timeout`). Being connected is not the same as being subscribed. If nothing confirms a connection's subscriptions, the session is rebuilt rather than left silently listening to nothing.
+- **A fresh session on reconnect.** Reusing a Faye session across a dropped socket is unreliable — the server can keep delivering to the connection that just died — so a reconnect takes a new one. Rebuilding is retried with backoff, because a network that is down when the client notices is usually still down a second later.
 
-If you would rather do your own supervision, set `reconnect=None` and `stall_timeout=None`.
+If you would rather do your own supervision, set `reconnect=None`, `stall_timeout=None` and `subscribe_timeout=None`.
 
 ## Methods
 

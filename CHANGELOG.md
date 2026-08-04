@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.0.6
+
+Reconnecting is not the same as recovering. 0.0.5 reconnected reliably but
+could come back subscribed to nothing, or subscribed to a session the server
+had already moved on from. On a flaky network that showed up as a client that
+was connected, healthy looking, and quietly receiving nothing.
+
+- **A reconnect now takes a fresh Faye session.** Reusing a session across a
+  dropped socket is unreliable: the server can keep delivering to the
+  connection that just died, and messages only reappear once it times that
+  out. Live, reusing the session made delivery after a reconnect fail about
+  half the time; taking a fresh one made three consecutive full runs pass. If
+  the handshake fails the old session is kept and the subscription check below
+  takes over. Disable with `client.rehandshake_on_reconnect = False`.
+- **Session recovery is retried.** A single failed handshake used to end
+  recovery, and nothing was left in flight that would ever try again, so the
+  client stranded itself until the 180s stall check happened to notice. It now
+  retries with backoff (`recovery_attempts`, `recovery_max_backoff`) and drops
+  the socket to force a reconnect if it runs out of attempts. Verified live
+  against a simulated outage: session rebuilt and delivering again in 7s.
+- **Recovery no longer blocks the reader thread.** It runs in its own thread,
+  so the client can still see the replies it is waiting for.
+- **A rebuilt session reconnects its delivery channel.** Re-subscribing alone
+  left a session that looked fully recovered and received nothing, because
+  Faye delivers on the connect channel. Caught live: the session rebuilt in 4
+  seconds and no message ever arrived.
+- **Added `subscribe_timeout` (default 15s).** Being connected is not the same
+  as being subscribed. If no subscription is confirmed on a connection, the
+  session is rebuilt. This catches both a reaped session, which rejects every
+  subscribe, and a half dead socket, which answers nothing.
+
 ## 0.0.5
 
 Fixes the long-run failure where the client keeps running, reports itself

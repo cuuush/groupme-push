@@ -58,7 +58,7 @@ class PushClient:
         on_error: called with the exception whenever the websocket errors.
         disregard_self: skip events sent by the authenticated user.
         reconnect: seconds to wait before reconnecting after a dropped
-            connection. ``None`` disables reconnection.
+            connection. Defaults to 5; ``None`` disables reconnection.
         group_ids: only dispatch events belonging to these group ids. GroupMe
             pushes *every* group's traffic down the personal ``/user`` channel,
             so this filter (not ``subscribe_to_group``) is what narrows the
@@ -82,6 +82,9 @@ class PushClient:
             nothing down an idle connection, so this costs one small frame per
             quiet interval rather than a reconnect. ``None`` disables the check.
         probe_timeout: how long that check waits for an answer.
+        subscribe_timeout: how long to wait for a connection's subscriptions to
+            be accepted before rebuilding the Faye session. Being connected is
+            not the same as being subscribed. ``None`` disables the check.
     """
 
     def __init__(
@@ -104,6 +107,7 @@ class PushClient:
         ping_timeout=10,
         stall_timeout=180,
         probe_timeout=10,
+        subscribe_timeout=15,
     ):
         self.id = 1
         self.access_token = access_token
@@ -126,10 +130,17 @@ class PushClient:
             max(5.0, stall_timeout / 4.0) if stall_timeout else None
         )
         self.probe_timeout = probe_timeout
+        self.subscribe_timeout = subscribe_timeout
 
-        # Minimum gap between re-handshakes, so a server that keeps rejecting
-        # us cannot turn into a handshake loop.
-        self.rehandshake_interval = 30
+        # Minimum gap between session rebuilds, so a server that keeps
+        # rejecting us cannot turn into a handshake loop.
+        self.recovery_interval = 30
+        self.recovery_attempts = 6
+        # Take a fresh Faye session whenever the socket reconnects.
+        self.rehandshake_on_reconnect = True
+        self.recovery_max_backoff = 30
+        # Backwards compatible alias.
+        self.rehandshake_interval = self.recovery_interval
 
         self.group_ids = {str(group_id) for group_id in group_ids or ()}
 
@@ -143,8 +154,12 @@ class PushClient:
         self.client_id = None
 
         self._last_frame_at = 0.0
-        self._last_rehandshake_at = 0.0
+        self._last_recovery_at = 0.0
         self._watchdog_thread = None
+        self._recovery_thread = None
+        self._connections = 0
+        self._subscription_thread = None
+        self._subscription_confirmed = threading.Event()
 
         # Groups we want, versus groups already subscribed on this connection.
         # The second set is what stops a group being subscribed twice when a
@@ -497,6 +512,20 @@ class PushClient:
             self._subscribe_group_once(self.ws, group_id)
         return True
 
+    def _resubscribe_all(self, ws):
+        """Subscribe this connection to everything the caller asked for.
+
+        A new connection carries none of the old connection's subscriptions,
+        and neither does a new Faye session, so both paths come through here.
+        """
+        with self._subscribe_lock:
+            self._active_groups.clear()
+            self._subscription_confirmed.clear()
+            if self.subscribe_to_user_channel and self.user_id is not None:
+                self.subscribe(ws, "/user/{}".format(self.user_id))
+            for group_id in sorted(self._subscribed_groups):
+                self._subscribe_group_once(ws, group_id)
+
     def _subscribe_group_once(self, ws, group_id):
         """Subscribe to a group unless this connection already did.
 
@@ -564,15 +593,24 @@ class PushClient:
     def on_open(self, ws):
         logger.debug("Socket open")
 
-        with self._subscribe_lock:
-            # A new connection carries none of the old connection's
-            # subscriptions, so replay every group we were asked for.
-            self._active_groups.clear()
-            if self.subscribe_to_user_channel:
-                self.subscribe(ws, "/user/{}".format(self.user_id))
-            for group_id in sorted(self._subscribed_groups):
-                self._subscribe_group_once(ws, group_id)
+        self._connections += 1
+        if self._connections > 1 and self.rehandshake_on_reconnect:
+            # Reusing a session across a dropped socket is unreliable: the
+            # server can go on delivering to the connection that just died,
+            # and messages only reappear once it times that out. A fresh
+            # client id starts clean. If this fails we carry on with the old
+            # id and let the subscription check rebuild.
+            logger.debug("Reconnected, taking a fresh Faye session")
+            try:
+                self.client_id = self._handshake()
+            except (GroupMePushError, requests.RequestException) as error:
+                logger.warning(
+                    "Could not get a fresh session on reconnect ({}), "
+                    "continuing with the old one".format(error)
+                )
 
+        self._resubscribe_all(ws)
+        with self._subscribe_lock:
             # Exactly one /meta/connect is in flight at a time: the reply to
             # this one is what triggers the next. Sending extras multiplies the
             # polling loop and delivers every event more than once.
@@ -581,6 +619,11 @@ class PushClient:
             # Set last: callers waiting on this must not start subscribing
             # halfway through the handshake above.
             self._connected.set()
+
+        # A brand new connection deserves a fresh chance to recover, whatever
+        # happened on the last one.
+        self._last_recovery_at = 0.0
+        self._watch_subscriptions(ws)
 
         if self.connect_callback is not None:
             self._dispatch(self.connect_callback, ())
@@ -632,6 +675,7 @@ class PushClient:
 
         if channel == "/meta/subscribe":
             if envelope.get("successful"):
+                self._subscription_confirmed.set()
                 logger.debug(
                     "Subscription success to {}".format(envelope.get("subscription"))
                 )
@@ -648,7 +692,7 @@ class PushClient:
                 # reliably arrives. Ignoring it leaves a socket that is open,
                 # "connected" and permanently silent.
                 if error.startswith(_INVALID_CLIENT_ID):
-                    self._rehandshake(ws)
+                    self._recover_session(ws)
             return
 
         if channel == "/meta/unsubscribe":
@@ -704,7 +748,7 @@ class PushClient:
             return
 
         if error.startswith(_INVALID_CLIENT_ID) or advice.get("reconnect") == "handshake":
-            self._rehandshake(ws)
+            self._recover_session(ws)
             return
 
         # Unknown failure: back off a little and retry rather than dropping
@@ -712,28 +756,108 @@ class PushClient:
         if not self._stopped.wait(timeout=self.retry_backoff):
             self.send_connect(ws)
 
-    def _rehandshake(self, ws):
-        """Get a fresh Faye client id and re-subscribe everything.
+    def _watch_subscriptions(self, ws):
+        """Make sure the subscriptions we just sent are actually accepted.
 
-        Our session was reaped, so the socket is open but will never deliver
-        again. Rate limited, because a server that keeps rejecting us should
-        not turn into a handshake loop.
+        Being connected is not the same as being subscribed. A reaped session
+        answers every subscribe with 401, and a half dead socket answers
+        nothing at all; either way the client looks healthy and receives
+        nothing, which is the failure this whole layer exists to prevent.
         """
-        since_last = time.time() - self._last_rehandshake_at
-        if since_last < self.rehandshake_interval:
+        if not self.subscribe_timeout:
+            return
+        existing = self._subscription_thread
+        if existing is not None and existing.is_alive():
+            return
+        self._subscription_thread = threading.Thread(
+            target=self._check_subscriptions,
+            args=(ws,),
+            name="groupme-push-subscriptions",
+            daemon=True,
+        )
+        self._subscription_thread.start()
+
+    def _check_subscriptions(self, ws):
+        if self._subscription_confirmed.wait(self.subscribe_timeout):
+            return
+        if self._stopped.is_set() or not self._connected.is_set():
+            return
+        logger.warning(
+            "No subscription confirmed within {}s, rebuilding the session".format(
+                self.subscribe_timeout
+            )
+        )
+        self._recover_session(ws)
+
+    def _recover_session(self, ws):
+        """Rebuild the Faye session, off the reader thread.
+
+        Runs in its own thread because it retries with backoff, and blocking
+        the reader would stop us noticing the reply we are waiting for.
+        """
+        since_last = time.time() - self._last_recovery_at
+        if since_last < self.recovery_interval:
             logger.debug(
-                "Skipping re-handshake, last one was {:.0f}s ago".format(since_last)
+                "Skipping session recovery, last one was {:.0f}s ago".format(since_last)
             )
             return
-        self._last_rehandshake_at = time.time()
-
-        logger.info("Faye client id expired, re-handshaking")
-        try:
-            self.client_id = self._handshake()
-        except GroupMePushError as handshake_error:
-            logger.error("Re-handshake failed: {}".format(handshake_error))
+        existing = self._recovery_thread
+        if existing is not None and existing.is_alive():
+            logger.debug("Session recovery already in progress")
             return
-        self.on_open(ws)
+        self._last_recovery_at = time.time()
+        self._recovery_thread = threading.Thread(
+            target=self._recover_session_blocking,
+            args=(ws,),
+            name="groupme-push-recovery",
+            daemon=True,
+        )
+        self._recovery_thread.start()
+
+    def _recover_session_blocking(self, ws):
+        """Handshake until it works, then re-subscribe.
+
+        A network that is down when we notice the problem is usually still
+        down a second later, so one attempt is not enough. Without the retry
+        the client strands itself: nothing else is in flight that would ever
+        trigger another attempt.
+        """
+        for attempt in range(self.recovery_attempts):
+            if self._stopped.is_set():
+                return
+            logger.info(
+                "Rebuilding Faye session, attempt {}/{}".format(
+                    attempt + 1, self.recovery_attempts
+                )
+            )
+            try:
+                self.client_id = self._handshake()
+            except (GroupMePushError, requests.RequestException) as error:
+                backoff = min(2 ** attempt, self.recovery_max_backoff)
+                logger.warning(
+                    "Handshake failed ({}), retrying in {}s".format(error, backoff)
+                )
+                if self._stopped.wait(backoff):
+                    return
+                continue
+
+            self._resubscribe_all(ws)
+            with self._subscribe_lock:
+                # The new client id has subscriptions but no delivery channel
+                # until it connects. Skipping this leaves a session that looks
+                # fully rebuilt and never receives anything.
+                self.send_connect(ws)
+            self._watch_subscriptions(ws)
+            return
+
+        logger.error(
+            "Could not rebuild the session after {} attempts, "
+            "dropping the socket to force a reconnect".format(self.recovery_attempts)
+        )
+        self._force_reconnect()
+
+    # Kept as the name the older code used for this.
+    _rehandshake = _recover_session
 
     # -- dispatch ----------------------------------------------------------
 
