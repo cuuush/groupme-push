@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.0.5
+
+Fixes the long-run failure where the client keeps running, reports itself
+connected, and silently never delivers another message.
+
+Three separate causes, all confirmed against the live service:
+
+- **An idle connection is closed by the server, and nothing reconnected it.**
+  A client left idle was dropped with `Connection timed out` within ten
+  minutes. `reconnect` defaulted to `None`, so `run_forever` returned, the
+  reader thread exited, and the client was dead for the rest of the process's
+  life without raising anything the caller would notice. `reconnect` now
+  defaults to 5 seconds.
+- **A dead connection did not raise at all.** Without websocket pings the
+  reader blocks forever on a socket that will never produce another byte,
+  which is what a NAT timeout or a sleeping laptop leaves behind. Added
+  `ping_interval=30` / `ping_timeout=10`, verified to be answered by GroupMe.
+- **A reaped Faye session was never noticed.** GroupMe rejects the
+  subscriptions of a reaped session with `401:<clientid>:Unknown client`, which
+  was logged and otherwise ignored, leaving an open socket subscribed to
+  nothing. Both a rejected subscribe and a rejected connect now trigger a
+  re-handshake and a full re-subscribe, rate limited so a server that keeps
+  rejecting us cannot become a handshake loop.
+
+### Added
+
+- `stall_timeout` (default 180s): after a quiet stretch the client checks that
+  the stream still works. GroupMe sends nothing at all down an idle connection
+  — measured over ten minutes — so silence cannot be treated as a fault. The
+  check re-subscribes to a channel already held, which is the one request
+  GroupMe reliably answers: an answer means healthy, an error means the session
+  died, no answer means the socket is gone. Set to `None` to disable.
+- `probe_timeout` (default 10s) for that check.
+- `ping_interval` / `ping_timeout`, settable or `None` to disable.
+
+### Changed
+
+- `reconnect` now defaults to `5` instead of `None`. Pass `reconnect=None` for
+  the old behaviour of never reconnecting.
+
 ## 0.0.4
 
 ### Fixed

@@ -56,11 +56,26 @@ for group_id, name in PushClient(access_token="useraccesstoken").list_groups():
 | `on_connect` | Called with no arguments each time the socket becomes ready, including after a reconnect. |
 | `on_error` | Called with the exception when the websocket errors. |
 | `disregard_self` | Skip events sent by the authenticated user. Default `False`. |
-| `reconnect` | Seconds to wait before reconnecting after a dropped connection. `None` (the default) disables reconnection. |
+| `reconnect` | Seconds to wait before reconnecting after a dropped connection. Default `5`. `None` disables reconnection, which means any drop is permanent. |
+| `ping_interval` / `ping_timeout` | Websocket keepalive. Defaults `30` / `10`. See below. |
+| `stall_timeout` | Seconds of silence after which the client checks that the stream is still alive. Default `180`. `None` disables the check. |
+| `probe_timeout` | How long that check waits for an answer. Default `10`. |
 | `group_ids` | Only dispatch events from these groups. Default: no filtering. |
 | `subscribe_to_user_channel` | Subscribe to `/user/<id>` on connect. This is where GroupMe delivers messages, so leave it on unless you know otherwise. Default `True`. |
 | `threaded_callbacks` | Run each callback in its own thread. Set `False` to run them inline, which keeps events in order but blocks the socket while they run. Default `True`. |
 | `request_timeout` | Timeout in seconds for the HTTP calls `start()` makes. Default `5`. |
+
+## Staying connected
+
+A GroupMe push connection does not stay up on its own. An idle one is closed by the server, and the Faye session behind it gets reaped, after which the socket can still look perfectly healthy while never delivering anything again. That is the "it ran fine all day and then just stopped receiving" failure.
+
+The client handles this out of the box:
+
+- **Websocket pings** (`ping_interval`) keep the connection warm and, more importantly, make a dead connection *raise* instead of hanging. Without them the reader blocks on a socket that will never produce another byte, which is what a sleeping laptop or a NAT timeout leaves behind.
+- **Automatic reconnection** is on by default (`reconnect=5`). Subscriptions are replayed on the new connection.
+- **A liveness check** (`stall_timeout`). GroupMe sends nothing at all down an idle connection, so silence proves nothing on its own. After a quiet stretch the client asks a question instead of guessing: it re-subscribes to a channel it already holds, which is the one request GroupMe reliably answers. An answer means the stream is fine, an error means the session was reaped and it re-handshakes, and no answer at all means the socket is gone and it reconnects.
+
+If you would rather do your own supervision, set `reconnect=None` and `stall_timeout=None`.
 
 ## Methods
 

@@ -397,32 +397,19 @@ class TestLifecycle:
 
         assert opened == [True]
 
-    def test_reconnect_is_passed_through_to_run_forever(self, monkeypatch):
+    def test_connects_to_the_faye_endpoint(self, monkeypatch):
         captured = {}
 
         class FakeApp:
             def __init__(self, url, **kwargs):
                 captured["url"] = url
+                captured["handlers"] = sorted(kwargs)
 
             def run_forever(self, **kwargs):
-                captured["kwargs"] = kwargs
-
-        monkeypatch.setattr("groupme_push.client.websocket.WebSocketApp", FakeApp)
-        PushClient(access_token="token", reconnect=5).run_forever()
-
-        assert captured["kwargs"] == {"reconnect": 5}
-
-    def test_no_reconnect_kwarg_when_unset(self, monkeypatch):
-        captured = {}
-
-        class FakeApp:
-            def __init__(self, url, **kwargs):
                 pass
-
-            def run_forever(self, **kwargs):
-                captured["kwargs"] = kwargs
 
         monkeypatch.setattr("groupme_push.client.websocket.WebSocketApp", FakeApp)
         PushClient(access_token="token").run_forever()
 
-        assert captured["kwargs"] == {}
+        assert captured["url"] == "wss://push.groupme.com/faye"
+        assert captured["handlers"] == ["on_close", "on_error", "on_message", "on_open"]
