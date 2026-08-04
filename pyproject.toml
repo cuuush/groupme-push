@@ -4,21 +4,41 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "groupme-push"
-version = "0.0.3"
+version = "0.1.0"
 description = "GroupMe push service wrapper"
 license = {text = "GPL-3.0-or-later"}
 readme = "README.md"
 authors = [{ name = "Chris Cush", email = "chris@cuuush.com" }]
-keywords = ["groupme", "push", "websocket"]
+keywords = ["groupme", "push", "websocket", "faye"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+]
 dependencies = [
     "base36>=0.1.1",
-    "requests~=2.31.0",
+    "requests>=2.31.0",
     "websocket-client>=1.7.0"
 ]
 requires-python = ">=3.9"
 
-
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
 
 [project.urls]
 Homepage = "https://github.com/cuuush/groupme-push"
+Issues = "https://github.com/cuuush/groupme-push/issues"
+Changelog = "https://github.com/cuuush/groupme-push/blob/main/CHANGELOG.md"
 
+[tool.setuptools]
+packages = ["groupme_push"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
